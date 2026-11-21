@@ -1,0 +1,956 @@
+--- Describes the shape of a value and checks values against it.
+---
+--- A schema is a value built from constructors such as `schema.string` and
+--- `schema.object` and refined by methods such as `min` and `optional`.
+--- `schema:parse(value)` returns the parsed value or raises an error object
+--- that lists every issue with its path.
+---
+--- @package schema
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-schema
+
+local M = {}
+
+local Schema = {}
+Schema.__index = Schema
+
+local type, math_type, tostring, tonumber = type, math.type, tostring, tonumber
+local setmetatable, ipairs, pairs = setmetatable, ipairs, pairs
+
+-- Issues ------------------------------------------------------------------
+
+-- A path is a linked list of `{ parent, key }` pairs, built only when a
+-- check fails, so a value that passes allocates no path.
+local function path_list(path)
+    local out = {}
+    while path do
+        table.insert(out, 1, path[2])
+        path = path[1]
+    end
+    return out
+end
+
+local function path_text(list)
+    if #list == 0 then
+        return "value"
+    end
+    local parts = {}
+    for i, key in ipairs(list) do
+        if math_type(key) == "integer" then
+            parts[i] = `[$key]`
+        elseif i == 1 then
+            parts[i] = tostring(key)
+        else
+            parts[i] = "." .. tostring(key)
+        end
+    end
+    return table.concat(parts)
+end
+
+local function fail(issues, path, code, message)
+    local n = issues.n + 1
+    issues.n = n
+    issues[n] = { code = code, message = message, path = path_list(path) }
+    return nil
+end
+
+local ParseError = {}
+ParseError.__index = ParseError
+ParseError.__tostring = function(err)
+    local lines = {}
+    for i, issue in ipairs(err.issues) do
+        lines[i] = `$(path_text(issue.path)): $(issue.message)`
+    end
+    return table.concat(lines, "\n")
+end
+
+local function parse_error(issues)
+    local list = {}
+    for i = 1, issues.n do
+        list[i] = issues[i]
+    end
+    local first = list[1]
+    return setmetatable({
+        message = `$(path_text(first.path)): $(first.message)`,
+        issues = list,
+    }, ParseError)
+end
+
+--- Returns true if `value` is an error object that `parse` raised.
+--- @param value any The value to test.
+--- @return boolean
+function M.iserror(value)
+    return getmetatable(value) == ParseError
+end
+
+-- Construction --------------------------------------------------------------
+
+-- Every schema keeps its `kind`, the options its methods set, and a compiled
+-- `run(value, path, issues)` function. `run` returns the parsed value. A
+-- failed check appends to `issues` and returns nil, so callers detect failure
+-- by comparing `issues.n` before and after.
+
+local compile
+
+local function make(kind, fields)
+    local s = setmetatable(fields or {}, Schema)
+    s.kind = kind
+    return s
+end
+
+local function derive(base, changes)
+    local s = setmetatable({}, Schema)
+    for k, v in pairs(base) do
+        s[k] = v
+    end
+    for k, v in pairs(changes) do
+        s[k] = v
+    end
+    s.run = nil
+    s.checks = changes.checks or base.checks
+    return s
+end
+
+local function add_check(base, check)
+    local checks = {}
+    if base.checks then
+        for i, c in ipairs(base.checks) do
+            checks[i] = c
+        end
+    end
+    checks[#checks + 1] = check
+    return derive(base, { checks = checks })
+end
+
+local function runner(s)
+    local run = s.run
+    if run == nil then
+        run = compile(s)
+        s.run = run
+    end
+    return run
+end
+
+local function type_name(value)
+    local t = type(value)
+    if t == "number" then
+        return math_type(value)
+    end
+    return t
+end
+
+-- Each base check takes `(value, path, issues)` and returns the value or
+-- fails. `compile` wraps it with optional, default, refinements, and
+-- transforms.
+local base_checks = {}
+
+function base_checks.any()
+    return function(v)
+        return v
+    end
+end
+
+function base_checks.string(s)
+    local coerce = s.coerce
+    return function(v, path, issues)
+        if type(v) == "string" then
+            return v
+        end
+        if coerce and (type(v) == "number" or type(v) == "boolean") then
+            return tostring(v)
+        end
+        return fail(issues, path, "type", `expected string, got $(type_name(v))`)
+    end
+end
+
+function base_checks.number(s)
+    local coerce = s.coerce
+    return function(v, path, issues)
+        if type(v) == "number" then
+            return v
+        end
+        if coerce and type(v) == "string" then
+            local n = tonumber(v)
+            if n ~= nil then
+                return n
+            end
+        end
+        return fail(issues, path, "type", `expected number, got $(type_name(v))`)
+    end
+end
+
+function base_checks.integer(s)
+    local coerce = s.coerce
+    return function(v, path, issues)
+        if math_type(v) == "integer" then
+            return v
+        end
+        if math_type(v) == "float" and v == v // 1 and v >= math.mininteger and v <= math.maxinteger then
+            return math.tointeger(v)
+        end
+        if coerce and type(v) == "string" and v:match("^%s*[-+]?%d+%s*$") then
+            local n = math.tointeger(tonumber(v))
+            if n ~= nil then
+                return n
+            end
+        end
+        return fail(issues, path, "type", `expected integer, got $(type_name(v))`)
+    end
+end
+
+local TRUE_WORDS = { ["true"] = true, ["1"] = true, yes = true, on = true }
+local FALSE_WORDS = { ["false"] = false, ["0"] = false, no = false, off = false, [""] = false }
+
+function base_checks.boolean(s)
+    local coerce = s.coerce
+    return function(v, path, issues)
+        if type(v) == "boolean" then
+            return v
+        end
+        if coerce and type(v) == "string" then
+            local lower = v:lower()
+            if TRUE_WORDS[lower] then
+                return true
+            end
+            if FALSE_WORDS[lower] == false then
+                return false
+            end
+        end
+        return fail(issues, path, "type", `expected boolean, got $(type_name(v))`)
+    end
+end
+
+function base_checks.vector()
+    return function(v, path, issues)
+        if type(v) == "vector" then
+            return v
+        end
+        return fail(issues, path, "type", `expected vector, got $(type_name(v))`)
+    end
+end
+
+function base_checks.literal(s)
+    local expected = s.value
+    return function(v, path, issues)
+        if v == expected then
+            return v
+        end
+        return fail(issues, path, "literal", `expected $(tojson(expected))`)
+    end
+end
+
+function base_checks.oneof(s)
+    local set = {}
+    for _, value in ipairs(s.values) do
+        set[value] = true
+    end
+    local names = {}
+    for i, value in ipairs(s.values) do
+        names[i] = tojson(value)
+    end
+    local listed = table.concat(names, ", ")
+    return function(v, path, issues)
+        if v ~= nil and set[v] then
+            return v
+        end
+        return fail(issues, path, "oneof", `expected one of $listed`)
+    end
+end
+
+function base_checks.array(s)
+    local item = runner(s.item)
+    return function(v, path, issues)
+        if type(v) ~= "table" then
+            return fail(issues, path, "type", `expected array, got $(type_name(v))`)
+        end
+        local n = #v
+        for k in pairs(v) do
+            if math_type(k) ~= "integer" or k < 1 or k > n then
+                return fail(issues, path, "type", "expected array, got table with non-sequence keys")
+            end
+        end
+        local out = {}
+        local before = issues.n
+        for i = 1, n do
+            local parsed = item(v[i], { path, i }, issues)
+            out[i] = parsed
+        end
+        if issues.n > before then
+            return nil
+        end
+        return out
+    end
+end
+
+function base_checks.tuple(s)
+    local items = {}
+    for i, item in ipairs(s.items) do
+        items[i] = runner(item)
+    end
+    local count = #items
+    return function(v, path, issues)
+        if type(v) ~= "table" then
+            return fail(issues, path, "type", `expected array, got $(type_name(v))`)
+        end
+        if #v > count then
+            return fail(issues, path, "length", `expected at most $count items, got $(#v)`)
+        end
+        local out = {}
+        local before = issues.n
+        for i = 1, count do
+            out[i] = items[i](v[i], { path, i }, issues)
+        end
+        if issues.n > before then
+            return nil
+        end
+        return out
+    end
+end
+
+function base_checks.object(s)
+    local keys, runs = {}, {}
+    for key in pairs(s.shape) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for i, key in ipairs(keys) do
+        runs[i] = runner(s.shape[key])
+    end
+    local count = #keys
+    local unknown = s.unknown or "strip"
+    local shape = s.shape
+    local rest = s.rest and runner(s.rest)
+    return function(v, path, issues)
+        if type(v) ~= "table" then
+            return fail(issues, path, "type", `expected object, got $(type_name(v))`)
+        end
+        local out = {}
+        local before = issues.n
+        for i = 1, count do
+            local key = keys[i]
+            local parsed = runs[i](v[key], { path, key }, issues)
+            if parsed ~= nil then
+                out[key] = parsed
+            end
+        end
+        if unknown ~= "strip" or rest then
+            for key, value in pairs(v) do
+                if shape[key] == nil then
+                    if rest then
+                        out[key] = rest(value, { path, key }, issues)
+                    elseif unknown == "strict" then
+                        fail(issues, { path, key }, "unknown", "unknown key")
+                    else
+                        out[key] = value
+                    end
+                end
+            end
+        end
+        if issues.n > before then
+            return nil
+        end
+        return out
+    end
+end
+
+function base_checks.record(s)
+    local key_run = runner(s.key)
+    local value_run = runner(s.value)
+    return function(v, path, issues)
+        if type(v) ~= "table" then
+            return fail(issues, path, "type", `expected object, got $(type_name(v))`)
+        end
+        local out = {}
+        local before = issues.n
+        for key, value in pairs(v) do
+            local k = key_run(key, { path, key }, issues)
+            local parsed = value_run(value, { path, key }, issues)
+            if k ~= nil then
+                out[k] = parsed
+            end
+        end
+        if issues.n > before then
+            return nil
+        end
+        return out
+    end
+end
+
+function base_checks.union(s)
+    local options = {}
+    for i, option in ipairs(s.options) do
+        options[i] = runner(option)
+    end
+    return function(v, path, issues)
+        local trial = { n = 0 }
+        for _, run in ipairs(options) do
+            trial.n = 0
+            local parsed = run(v, path, trial)
+            if trial.n == 0 then
+                return parsed
+            end
+        end
+        return fail(issues, path, "union", "matches none of the allowed schemas")
+    end
+end
+
+function base_checks.lazy(s)
+    local get = s.get
+    local run
+    return function(v, path, issues)
+        if run == nil then
+            run = runner(get())
+        end
+        return run(v, path, issues)
+    end
+end
+
+-- Size checks apply to the length of a string or an array and to the value of
+-- a number.
+local function measure(v)
+    local t = type(v)
+    if t == "string" or t == "table" then
+        return #v, true
+    end
+    return v, false
+end
+
+local function size_check(op, limit, message)
+    return function(v, path, issues)
+        local size, counted = measure(v)
+        local ok
+        if op == "min" then
+            ok = size >= limit
+        elseif op == "max" then
+            ok = size <= limit
+        else
+            ok = size == limit
+        end
+        if ok then
+            return v
+        end
+        local text = message
+        if text == nil then
+            local unit = counted and (type(v) == "string" and " characters" or " items") or ""
+            local word = op == "min" and "at least" or op == "max" and "at most" or "exactly"
+            text = `expected $word $limit$unit`
+        end
+        return fail(issues, path, op, text)
+    end
+end
+
+compile = function(s)
+    local base = base_checks[s.kind](s)
+    local checks = s.checks
+    local transforms = s.transforms
+    local run = base
+    if checks or transforms then
+        local list = checks or {}
+        local tlist = transforms or {}
+        run = function(v, path, issues)
+            local before = issues.n
+            local value = base(v, path, issues)
+            if issues.n > before then
+                return nil
+            end
+            for i = 1, #list do
+                value = list[i](value, path, issues)
+                if issues.n > before then
+                    return nil
+                end
+            end
+            for i = 1, #tlist do
+                value = tlist[i](value)
+            end
+            return value
+        end
+    end
+    local optional, nullable, default = s.optional_flag, s.nullable_flag, s.default_value
+    if default ~= nil then
+        local inner = run
+        local is_function = type(default) == "function"
+        return function(v, path, issues)
+            if v == nil then
+                if is_function then
+                    return default()
+                end
+                return default
+            end
+            return inner(v, path, issues)
+        end
+    end
+    if optional or nullable then
+        local inner = run
+        return function(v, path, issues)
+            if v == nil then
+                return nil
+            end
+            return inner(v, path, issues)
+        end
+    end
+    local inner = run
+    return function(v, path, issues)
+        if v == nil then
+            return fail(issues, path, "required", "required")
+        end
+        return inner(v, path, issues)
+    end
+end
+
+-- Constructors ----------------------------------------------------------------
+
+--- Returns a schema that accepts any value except `nil`.
+--- @return table
+function M.any()
+    return make("any")
+end
+
+--- Returns a schema that accepts strings.
+--- @return table
+function M.string()
+    return make("string")
+end
+
+--- Returns a schema that accepts numbers of either subtype.
+--- @return table
+function M.number()
+    return make("number")
+end
+
+--- Returns a schema that accepts integers.
+---
+--- A float with an integral value, such as `3.0` from JSON, parses to the
+--- integer `3`.
+--- @return table
+function M.integer()
+    return make("integer")
+end
+
+--- Returns a schema that accepts `true` and `false`.
+--- @return table
+function M.boolean()
+    return make("boolean")
+end
+
+--- Returns a schema that accepts vectors.
+--- @return table
+function M.vector()
+    return make("vector")
+end
+
+--- Returns a schema that accepts exactly `value`.
+--- @param value any The only accepted value.
+--- @return table
+function M.literal(value)
+    return make("literal", { value = value })
+end
+
+--- Returns a schema that accepts one of the values in `values`.
+--- @param values table A list of strings, numbers, or booleans.
+--- @return table
+function M.oneof(values)
+    return make("oneof", { values = values })
+end
+
+--- Returns a schema that accepts a list whose items match `item`.
+--- @param item table The schema of every item.
+--- @return table
+function M.array(item)
+    return make("array", { item = item })
+end
+
+--- Returns a schema that accepts a list with one schema per position.
+--- @param items table A list of schemas.
+--- @return table
+function M.tuple(items)
+    return make("tuple", { items = items })
+end
+
+--- Returns a schema that accepts a table with the fields of `shape`.
+---
+--- Keys that `shape` does not name are left out of the parsed value, unless
+--- `strict`, `passthrough`, or `catchall` changes that.
+--- @param shape table A table from keys to schemas.
+--- @return table
+function M.object(shape)
+    return make("object", { shape = shape })
+end
+
+--- Returns a schema that accepts a table whose keys match `key` and whose
+--- values match `value`.
+--- @param key table The schema of every key.
+--- @param value table The schema of every value.
+--- @return table
+function M.record(key, value)
+    return make("record", { key = key, value = value })
+end
+
+--- Returns a schema that accepts a value that matches any of the schemas.
+---
+--- The schemas are tried in order and the first match parses the value.
+--- @param ... table The allowed schemas.
+--- @return table
+function M.union(...)
+    return make("union", { options = { ... } })
+end
+
+--- Returns a schema that calls `get` on first use, for recursive schemas.
+--- @param get function A function that returns the schema.
+--- @return table
+function M.lazy(get)
+    return make("lazy", { get = get })
+end
+
+--- Versions of `string`, `number`, `integer`, and `boolean` that convert
+--- strings first, for query strings and command line arguments.
+M.coerce = {
+    string = function() return make("string", { coerce = true }) end,
+    number = function() return make("number", { coerce = true }) end,
+    integer = function() return make("integer", { coerce = true }) end,
+    boolean = function() return make("boolean", { coerce = true }) end,
+}
+
+-- Methods -----------------------------------------------------------------------
+
+--- Returns a copy of the schema that also accepts `nil`.
+--- @return table
+function Schema:optional()
+    return derive(self, { optional_flag = true })
+end
+
+--- Returns a copy of the schema that also accepts `nil`.
+---
+--- Lus has one value for absence, so `nullable` and `optional` accept the
+--- same values. `json_schema` writes them differently.
+--- @return table
+function Schema:nullable()
+    return derive(self, { nullable_flag = true })
+end
+
+--- Returns a copy of the schema that parses `nil` to `value`.
+--- @param value any The default, or a function that returns it.
+--- @return table
+function Schema:default(value)
+    return derive(self, { default_value = value })
+end
+
+--- Returns a copy with a lower bound on the length of a string or list, or on
+--- a number.
+--- @param limit number The bound.
+--- @param message string? The message of the issue.
+--- @return table
+function Schema:min(limit, message)
+    return add_check(self, size_check("min", limit, message))
+end
+
+--- Returns a copy with an upper bound on the length of a string or list, or
+--- on a number.
+--- @param limit number The bound.
+--- @param message string? The message of the issue.
+--- @return table
+function Schema:max(limit, message)
+    return add_check(self, size_check("max", limit, message))
+end
+
+--- Returns a copy that requires an exact length.
+--- @param limit integer The length.
+--- @param message string? The message of the issue.
+--- @return table
+function Schema:length(limit, message)
+    return add_check(self, size_check("length", limit, message))
+end
+
+--- Returns a copy that requires a string to match a Lus pattern.
+--- @param pattern string The pattern.
+--- @param message string? The message of the issue.
+--- @return table
+function Schema:pattern(pattern, message)
+    return add_check(self, function(v, path, issues)
+        if string.find(v, pattern) then
+            return v
+        end
+        return fail(issues, path, "pattern", message or `does not match $pattern`)
+    end)
+end
+
+--- Returns a copy that requires `predicate(value)` to be truthy.
+--- @param predicate function The test.
+--- @param message string? The message of the issue.
+--- @return table
+function Schema:refine(predicate, message)
+    return add_check(self, function(v, path, issues)
+        if predicate(v) then
+            return v
+        end
+        return fail(issues, path, "refine", message or "is invalid")
+    end)
+end
+
+--- Returns a copy whose parsed value is `fn(value)`.
+--- @param fn function The transformation.
+--- @return table
+function Schema:transform(fn)
+    local list = {}
+    if self.transforms then
+        for i, t in ipairs(self.transforms) do
+            list[i] = t
+        end
+    end
+    list[#list + 1] = fn
+    return derive(self, { transforms = list })
+end
+
+--- Returns a copy of an object schema that reports unknown keys as issues.
+--- @return table
+function Schema:strict()
+    return derive(self, { unknown = "strict" })
+end
+
+--- Returns a copy of an object schema that keeps unknown keys unchanged.
+--- @return table
+function Schema:passthrough()
+    return derive(self, { unknown = "keep" })
+end
+
+--- Returns a copy of an object schema that parses unknown keys with `rest`.
+--- @param rest table The schema of every unknown value.
+--- @return table
+function Schema:catchall(rest)
+    return derive(self, { rest = rest })
+end
+
+--- Returns a copy of an object schema with the fields of `shape` added.
+--- @param shape table A table from keys to schemas.
+--- @return table
+function Schema:extend(shape)
+    local merged = {}
+    for k, v in pairs(self.shape) do
+        merged[k] = v
+    end
+    for k, v in pairs(shape) do
+        merged[k] = v
+    end
+    return derive(self, { shape = merged })
+end
+
+--- Returns a copy of an object schema with every field optional.
+--- @return table
+function Schema:partial()
+    local shape = {}
+    for k, v in pairs(self.shape) do
+        shape[k] = v:optional()
+    end
+    return derive(self, { shape = shape })
+end
+
+--- Returns a copy with a description, which `json_schema` writes.
+--- @param text string The description.
+--- @return table
+function Schema:describe(text)
+    return derive(self, { description = text })
+end
+
+--- Parses `value` and returns the parsed value.
+---
+--- If the value does not match, `parse` raises an error object with a
+--- `message` and an `issues` list. Each issue has a `code`, a `message`, and
+--- a `path` list.
+--- @param value any The value to parse.
+--- @return any The parsed value.
+function Schema:parse(value)
+    local issues = { n = 0 }
+    local parsed = runner(self)(value, nil, issues)
+    if issues.n > 0 then
+        error(parse_error(issues), 2)
+    end
+    return parsed
+end
+
+--- Parses `value` without raising.
+---
+--- Returns `true` and the parsed value on success. Returns `false` and the
+--- error object that `parse` would raise on failure.
+--- @param value any The value to parse.
+--- @return boolean
+--- @return any
+function Schema:check(value)
+    local issues = { n = 0 }
+    local parsed = runner(self)(value, nil, issues)
+    if issues.n > 0 then
+        return false, parse_error(issues)
+    end
+    return true, parsed
+end
+
+--- Returns the compiled check `run(value, path, issues)` of the schema.
+---
+--- Other packages use it to check many values without allocating an error
+--- object. `issues` is a table with a field `n`, and a failed check appends
+--- to it. `path` is `nil` at the root.
+--- @return function
+function Schema:compiled()
+    return runner(self)
+end
+
+--- Builds an error object from an issues table that `compiled` filled.
+--- @param issues table The issues.
+--- @return table
+function M.error(issues)
+    return parse_error(issues)
+end
+
+-- Serialization ----------------------------------------------------------------------
+
+local function projector(s)
+    local kind = s.kind
+    if kind == "object" then
+        local keys, subs = {}, {}
+        for key, sub in pairs(s.shape) do
+            local n = #keys + 1
+            keys[n] = key
+            subs[n] = projector(sub)
+        end
+        local count = #keys
+        local keep = s.unknown == "keep"
+        return function(v)
+            if type(v) ~= "table" then
+                return v
+            end
+            local out = {}
+            for i = 1, count do
+                local key = keys[i]
+                local value = v[key]
+                if value ~= nil then
+                    local sub = subs[i]
+                    out[key] = sub and sub(value) or value
+                end
+            end
+            if keep then
+                for key, value in pairs(v) do
+                    if out[key] == nil and s.shape[key] == nil then
+                        out[key] = value
+                    end
+                end
+            end
+            return out
+        end
+    elseif kind == "array" then
+        local item = projector(s.item)
+        if item == nil then
+            return nil
+        end
+        return function(v)
+            if type(v) ~= "table" then
+                return v
+            end
+            local out = {}
+            for i = 1, #v do
+                out[i] = item(v[i])
+            end
+            return out
+        end
+    elseif kind == "lazy" then
+        local inner
+        return function(v)
+            if inner == nil then
+                inner = projector(s.get()) or function(x) return x end
+            end
+            return inner(v)
+        end
+    end
+    return nil
+end
+
+--- Returns a function that encodes a value of the schema as JSON.
+---
+--- The function writes only the fields that object schemas declare, so a
+--- field that the schema leaves out never reaches the client. It checks no
+--- types. Values are encoded with `tojson`.
+--- @return function
+function Schema:serializer()
+    local project = projector(self)
+    if project == nil then
+        return tojson
+    end
+    return function(v)
+        return tojson(project(v))
+    end
+end
+
+local function json_schema(s)
+    local out
+    local kind = s.kind
+    if kind == "string" or kind == "number" or kind == "integer" or kind == "boolean" then
+        out = { type = kind }
+    elseif kind == "literal" then
+        out = { const = s.value }
+    elseif kind == "oneof" then
+        out = { ["enum"] = s.values }
+    elseif kind == "array" then
+        out = { type = "array", items = json_schema(s.item) }
+    elseif kind == "tuple" then
+        local items = {}
+        for i, item in ipairs(s.items) do
+            items[i] = json_schema(item)
+        end
+        out = { type = "array", prefixItems = items, items = false }
+    elseif kind == "object" then
+        local props, required = {}, {}
+        for key, sub in pairs(s.shape) do
+            props[key] = json_schema(sub)
+            if not (sub.optional_flag or sub.nullable_flag or sub.default_value ~= nil) then
+                required[#required + 1] = key
+            end
+        end
+        table.sort(required)
+        out = { type = "object", properties = props }
+        if #required > 0 then
+            out.required = required
+        end
+        if s.unknown == "strict" then
+            out.additionalProperties = false
+        elseif s.rest then
+            out.additionalProperties = json_schema(s.rest)
+        end
+    elseif kind == "record" then
+        out = { type = "object", additionalProperties = json_schema(s.value) }
+    elseif kind == "union" then
+        local any = {}
+        for i, option in ipairs(s.options) do
+            any[i] = json_schema(option)
+        end
+        out = { anyOf = any }
+    else
+        out = {}
+    end
+    if s.description then
+        out.description = s.description
+    end
+    if s.default_value ~= nil and type(s.default_value) ~= "function" then
+        out.default = s.default_value
+    end
+    if s.nullable_flag and out.type then
+        out.type = { out.type, "null" }
+    end
+    return out
+end
+
+--- Returns the JSON Schema of the schema as a table.
+---
+--- Refinements, patterns, and transforms have no JSON Schema form, so the
+--- result describes the types and the fields only.
+--- @return table
+function Schema:json_schema()
+    return json_schema(self)
+end
+
+--- Returns true if `value` is a schema.
+--- @param value any The value to test.
+--- @return boolean
+function M.isschema(value)
+    return getmetatable(value) == Schema
+end
+
+return M

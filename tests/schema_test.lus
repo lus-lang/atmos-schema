@@ -1,0 +1,176 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. ROOT .. "/*")
+package.path = ROOT .. "/?.lus;" .. package.path
+
+local s = require("schema")
+
+local function issues_of(schema, value)
+    local ok, err = schema:check(value)
+    assert(not ok, "expected the check to fail")
+    return err.issues
+end
+
+local function primitives_test()
+    assert(s.string():parse("a") == "a")
+    assert(s.number():parse(1.5) == 1.5)
+    assert(s.integer():parse(3) == 3)
+    assert(math.type(s.integer():parse(3.0)) == "integer")
+    assert(s.boolean():parse(false) == false)
+    assert(s.literal("x"):parse("x") == "x")
+    assert(s.oneof({ "a", "b" }):parse("b") == "b")
+    assert(s.any():parse(print) == print)
+end
+
+local function type_errors_test()
+    local issues = issues_of(s.string(), 1)
+    assert(issues[1].code == "type")
+    assert(issues[1].message == "expected string, got integer")
+    assert(issues_of(s.integer(), 1.5)[1].message == "expected integer, got float")
+    assert(issues_of(s.oneof({ "a", "b" }), "c")[1].message == 'expected one of "a", "b"')
+end
+
+local function required_and_optional_test()
+    assert(issues_of(s.string(), nil)[1].code == "required")
+    assert(s.string():optional():parse(nil) == nil)
+    assert(s.string():default("x"):parse(nil) == "x")
+    local n = 0
+    local counted = s.integer():default(function() n = n + 1 return n end)
+    assert(counted:parse(nil) == 1)
+    assert(counted:parse(nil) == 2)
+end
+
+local function sizes_test()
+    local name = s.string():min(2):max(4)
+    assert(name:parse("abc") == "abc")
+    assert(issues_of(name, "a")[1].message == "expected at least 2 characters")
+    assert(issues_of(name, "abcde")[1].message == "expected at most 4 characters")
+    assert(issues_of(s.integer():min(1), 0)[1].message == "expected at least 1")
+    assert(issues_of(s.array(s.integer()):length(2), { 1 })[1].message == "expected exactly 2 items")
+end
+
+local function methods_return_copies_test()
+    local base = s.string()
+    local short = base:max(2)
+    assert(base:parse("long text") == "long text")
+    assert(not short:check("long text"))
+end
+
+local function object_test()
+    local User = s.object({
+        name = s.string(),
+        age = s.integer():min(0):optional(),
+    })
+    local user = User:parse({ name = "Ada", age = 36, extra = true })
+    assert(user.name == "Ada" and user.age == 36)
+    assert(user.extra == nil)
+    local issues = issues_of(User, { age = -1 })
+    assert(#issues == 2)
+    local by_path = {}
+    for _, issue in ipairs(issues) do
+        by_path[table.concat(issue.path, ".")] = issue.code
+    end
+    assert(by_path.age == "min")
+    assert(by_path.name == "required")
+end
+
+local function object_modes_test()
+    local shape = { a = s.integer() }
+    assert(issues_of(s.object(shape):strict(), { a = 1, b = 2 })[1].code == "unknown")
+    assert(s.object(shape):passthrough():parse({ a = 1, b = 2 }).b == 2)
+    local rest = s.object(shape):catchall(s.string())
+    assert(rest:parse({ a = 1, b = "x" }).b == "x")
+    assert(not rest:check({ a = 1, b = 2 }))
+    local wider = s.object(shape):extend({ b = s.string() })
+    assert(wider:parse({ a = 1, b = "x" }).b == "x")
+    assert(s.object(shape):partial():parse({}) ~= nil)
+end
+
+local function nested_paths_test()
+    local schema = s.object({ items = s.array(s.object({ id = s.integer() })) })
+    local ok, err = schema:check({ items = { { id = 1 }, { id = "two" } } })
+    assert(not ok)
+    assert(err.issues[1].path[1] == "items")
+    assert(err.issues[1].path[2] == 2)
+    assert(err.issues[1].path[3] == "id")
+    assert(err.message == "items[2].id: expected integer, got string")
+    assert(tostring(err) == err.message)
+end
+
+local function arrays_reject_holes_test()
+    assert(not s.array(s.integer()):check({ 1, 2, x = 3 }))
+    assert(not s.array(s.integer()):check("1"))
+end
+
+local function tuple_and_record_test()
+    local point = s.tuple({ s.number(), s.number() })
+    assert(point:parse({ 1, 2 })[2] == 2)
+    assert(not point:check({ 1, 2, 3 }))
+    local counts = s.record(s.string(), s.integer())
+    assert(counts:parse({ a = 1, b = 2 }).b == 2)
+    assert(not counts:check({ a = "x" }))
+end
+
+local function union_test()
+    local id = s.union(s.integer(), s.string():pattern("^%x+$"))
+    assert(id:parse(5) == 5)
+    assert(id:parse("ff") == "ff")
+    assert(issues_of(id, "zz")[1].code == "union")
+end
+
+local function lazy_test()
+    local Node
+    Node = s.object({ value = s.integer(), children = s.array(s.lazy(function() return Node end)):optional() })
+    local tree = Node:parse({ value = 1, children = { { value = 2, children = { { value = 3 } } } } })
+    assert(tree.children[1].children[1].value == 3)
+    assert(not Node:check({ value = 1, children = { { value = "x" } } }))
+end
+
+local function refine_and_transform_test()
+    local even = s.integer():refine(function(n) return n % 2 == 0 end, "must be even")
+    assert(even:parse(4) == 4)
+    assert(issues_of(even, 3)[1].message == "must be even")
+    local upper = s.string():transform(string.upper)
+    assert(upper:parse("ab") == "AB")
+end
+
+local function coerce_test()
+    assert(s.coerce.integer():parse("42") == 42)
+    assert(s.coerce.number():parse("1.5") == 1.5)
+    assert(s.coerce.boolean():parse("yes") == true)
+    assert(s.coerce.boolean():parse("off") == false)
+    assert(s.coerce.string():parse(7) == "7")
+    assert(not s.coerce.integer():check("4.5"))
+    assert(not s.integer():check("42"))
+end
+
+local function parse_raises_test()
+    local ok, err = catch s.integer():parse("x")
+    assert(not ok)
+    assert(s.iserror(err))
+    assert(err.message == "value: expected integer, got string")
+end
+
+local function serializer_test()
+    local User = s.object({ id = s.integer(), tags = s.array(s.object({ name = s.string() })) })
+    local encode = User:serializer()
+    local text = encode({ id = 1, password = "secret", tags = { { name = "a", hidden = 1 } } })
+    local back = fromjson(text)
+    assert(back.id == 1)
+    assert(back.password == nil)
+    assert(back.tags[1].name == "a" and back.tags[1].hidden == nil)
+    assert(s.string():serializer()("x") == '"x"')
+end
+
+local function json_schema_test()
+    local schema = s.object({
+        name = s.string():describe("The name."),
+        age = s.integer():optional(),
+        kind = s.oneof({ "a", "b" }),
+    }):strict()
+    local js = schema:json_schema()
+    assert(js.type == "object")
+    assert(js.additionalProperties == false)
+    assert(js.properties.name.description == "The name.")
+    assert(#js.required == 2 and js.required[1] == "kind" and js.required[2] == "name")
+    assert(js.properties.kind["enum"][2] == "b")
+end
