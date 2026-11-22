@@ -1,4 +1,5 @@
---- Describes the shape of a value and checks values against it.
+--- Describes the shape of a value and checks values against it, reporting
+--- every issue with its path.
 ---
 --- A schema is a value built from constructors such as `schema.string` and
 --- `schema.object` and refined by methods such as `min` and `optional`.
@@ -6,7 +7,7 @@
 --- that lists every issue with its path.
 ---
 --- @package schema
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-schema
@@ -24,10 +25,14 @@ local setmetatable, ipairs, pairs = setmetatable, ipairs, pairs
 -- A path is a linked list of `{ parent, key }` pairs, built only when a
 -- check fails, so a value that passes allocates no path.
 local function path_list(path)
-    local out = {}
+    local out, n = {}, 0
     while path do
-        table.insert(out, 1, path[2])
+        n = n + 1
+        out[n] = path[2]
         path = path[1]
+    end
+    for i = 1, n // 2 do
+        out[i], out[n - i + 1] = out[n - i + 1], out[i]
     end
     return out
 end
@@ -603,8 +608,9 @@ function M.lazy(get)
     return make("lazy", { get = get })
 end
 
---- Versions of `string`, `number`, `integer`, and `boolean` that convert
---- strings first, for query strings and command line arguments.
+--- Versions of `string`, `number`, `integer`, and `boolean` that convert a
+--- string to the type before checking it. Query strings and command line
+--- arguments carry every value as a string.
 M.coerce = {
     string = function() return make("string", { coerce = true }) end,
     number = function() return make("number", { coerce = true }) end,
@@ -787,8 +793,9 @@ end
 --- Returns the compiled check `run(value, path, issues)` of the schema.
 ---
 --- Other packages use it to check many values without allocating an error
---- object. `issues` is a table with a field `n`, and a failed check appends
---- to it. `path` is `nil` at the root.
+--- object. `issues` is a table whose field `n` holds the number of issues,
+--- so a fresh one is `{ n = 0 }`. A failed check appends an issue to it and
+--- increments `n`. `path` is `nil` at the root.
 --- @return function
 function Schema:compiled()
     return runner(self)
@@ -866,8 +873,8 @@ end
 --- Returns a function that encodes a value of the schema as JSON.
 ---
 --- The function writes only the fields that object schemas declare, so a
---- field that the schema leaves out never reaches the client. It checks no
---- types. Values are encoded with `tojson`.
+--- field that the schema leaves out never reaches the client. It encodes
+--- values with `tojson` and checks no types.
 --- @return function
 function Schema:serializer()
     local project = projector(self)
