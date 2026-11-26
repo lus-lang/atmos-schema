@@ -34,7 +34,12 @@ local function required_and_optional_test()
     assert(s.string():optional():parse(nil) == nil)
     assert(s.string():default("x"):parse(nil) == "x")
     local n = 0
-    local counted = s.integer():default(function() n = n + 1 return n end)
+
+    local counted = s.integer():default(function()
+        n = n + 1
+        return n
+    end)
+
     assert(counted:parse(nil) == 1)
     assert(counted:parse(nil) == 2)
 end
@@ -45,7 +50,9 @@ local function sizes_test()
     assert(issues_of(name, "a")[1].message == "expected at least 2 characters")
     assert(issues_of(name, "abcde")[1].message == "expected at most 4 characters")
     assert(issues_of(s.integer():min(1), 0)[1].message == "expected at least 1")
-    assert(issues_of(s.array(s.integer()):length(2), { 1 })[1].message == "expected exactly 2 items")
+    assert(
+        issues_of(s.array(s.integer()):length(2), { 1 })[1].message == "expected exactly 2 items"
+    )
 end
 
 local function methods_return_copies_test()
@@ -66,9 +73,11 @@ local function object_test()
     local issues = issues_of(User, { age = -1 })
     assert(#issues == 2)
     local by_path = {}
+
     for _, issue in ipairs(issues) do
         by_path[table.concat(issue.path, ".")] = issue.code
     end
+
     assert(by_path.age == "min")
     assert(by_path.name == "required")
 end
@@ -119,14 +128,24 @@ end
 
 local function lazy_test()
     local Node
-    Node = s.object({ value = s.integer(), children = s.array(s.lazy(function() return Node end)):optional() })
-    local tree = Node:parse({ value = 1, children = { { value = 2, children = { { value = 3 } } } } })
+
+    Node = s.object({ value = s.integer(), children = s.array(s.lazy(function()
+        return Node
+    end)):optional() })
+
+    local tree = Node:parse({
+        value = 1,
+        children = { { value = 2, children = { { value = 3 } } } },
+    })
     assert(tree.children[1].children[1].value == 3)
     assert(not Node:check({ value = 1, children = { { value = "x" } } }))
 end
 
 local function refine_and_transform_test()
-    local even = s.integer():refine(function(n) return n % 2 == 0 end, "must be even")
+    local even = s.integer():refine(function(n)
+        return n % 2 == 0
+    end, "must be even")
+
     assert(even:parse(4) == 4)
     assert(issues_of(even, 3)[1].message == "must be even")
     local upper = s.string():transform(string.upper)

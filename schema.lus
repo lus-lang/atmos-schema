@@ -4,7 +4,22 @@
 --- A schema is a value built from constructors such as `schema.string` and
 --- `schema.object` and refined by methods such as `min` and `optional`.
 --- `schema:parse(value)` returns the parsed value or raises an error object
---- that lists every issue with its path.
+--- that lists every issue with its path. The API follows the TypeScript
+--- library zod.
+---
+--- The following example checks the configuration of a server.
+---
+--- ```lus nocheck
+--- local s = require("https://atmosp.here/2.0/schema.lus")
+---
+--- local Config = s.object({
+---     port = s.integer():min(1):max(65535),
+---     mode = s.oneof({ "dev", "prod" }),
+--- })
+---
+--- local config = Config:parse({ port = 8080, mode = "dev" })
+--- print(config.port)  --> 8080
+--- ```
 ---
 --- @package schema
 --- @version 1.0.0
@@ -26,14 +41,17 @@ local setmetatable, ipairs, pairs = setmetatable, ipairs, pairs
 -- check fails, so a value that passes allocates no path.
 local function path_list(path)
     local out, n = {}, 0
+
     while path do
         n = n + 1
         out[n] = path[2]
         path = path[1]
     end
+
     for i = 1, n // 2 do
         out[i], out[n - i + 1] = out[n - i + 1], out[i]
     end
+
     return out
 end
 
@@ -41,16 +59,19 @@ local function path_text(list)
     if #list == 0 then
         return "value"
     end
+
     local parts = {}
+
     for i, key in ipairs(list) do
         if math_type(key) == "integer" then
             parts[i] = `[$key]`
         elseif i == 1 then
             parts[i] = tostring(key)
         else
-            parts[i] = "." .. tostring(key)
+            parts[i] = `.$key`
         end
     end
+
     return table.concat(parts)
 end
 
@@ -63,19 +84,24 @@ end
 
 local ParseError = {}
 ParseError.__index = ParseError
+
 ParseError.__tostring = function(err)
     local lines = {}
+
     for i, issue in ipairs(err.issues) do
         lines[i] = `$(path_text(issue.path)): $(issue.message)`
     end
+
     return table.concat(lines, "\n")
 end
 
 local function parse_error(issues)
     local list = {}
+
     for i = 1, issues.n do
         list[i] = issues[i]
     end
+
     local first = list[1]
     return setmetatable({
         message = `$(path_text(first.path)): $(first.message)`,
@@ -106,43 +132,41 @@ local function make(kind, fields)
 end
 
 local function derive(base, changes)
-    local s = setmetatable({}, Schema)
-    for k, v in pairs(base) do
-        s[k] = v
-    end
+    local s = table.clone(base)
+
     for k, v in pairs(changes) do
         s[k] = v
     end
+
     s.run = nil
     s.checks = changes.checks or base.checks
     return s
 end
 
 local function add_check(base, check)
-    local checks = {}
-    if base.checks then
-        for i, c in ipairs(base.checks) do
-            checks[i] = c
-        end
-    end
+    local checks = base.checks and table.clone(base.checks) or {}
     checks[#checks + 1] = check
     return derive(base, { checks = checks })
 end
 
 local function runner(s)
     local run = s.run
+
     if run == nil then
         run = compile(s)
         s.run = run
     end
+
     return run
 end
 
 local function type_name(value)
     local t = type(value)
+
     if t == "number" then
         return math_type(value)
     end
+
     return t
 end
 
@@ -159,48 +183,59 @@ end
 
 function base_checks.string(s)
     local coerce = s.coerce
+
     return function(v, path, issues)
         if type(v) == "string" then
             return v
         end
+
         if coerce and (type(v) == "number" or type(v) == "boolean") then
             return tostring(v)
         end
+
         return fail(issues, path, "type", `expected string, got $(type_name(v))`)
     end
 end
 
 function base_checks.number(s)
     local coerce = s.coerce
+
     return function(v, path, issues)
         if type(v) == "number" then
             return v
         end
+
         if coerce and type(v) == "string" then
-            local n = tonumber(v)
-            if n ~= nil then
+            if n = tonumber(v) then
                 return n
             end
         end
+
         return fail(issues, path, "type", `expected number, got $(type_name(v))`)
     end
 end
 
 function base_checks.integer(s)
     local coerce = s.coerce
+
     return function(v, path, issues)
         if math_type(v) == "integer" then
             return v
         end
-        if math_type(v) == "float" and v == v // 1 and v >= math.mininteger and v <= math.maxinteger then
+
+        if math_type(v) == "float"
+            and v == v // 1
+            and v >= math.mininteger
+            and v <= math.maxinteger then
             return math.tointeger(v)
         end
+
         if coerce and type(v) == "string" and v:match("^%s*[-+]?%d+%s*$") then
-            local n = math.tointeger(tonumber(v))
-            if n ~= nil then
+            if n = math.tointeger(tonumber(v)) then
                 return n
             end
         end
+
         return fail(issues, path, "type", `expected integer, got $(type_name(v))`)
     end
 end
@@ -210,19 +245,24 @@ local FALSE_WORDS = { ["false"] = false, ["0"] = false, no = false, off = false,
 
 function base_checks.boolean(s)
     local coerce = s.coerce
+
     return function(v, path, issues)
         if type(v) == "boolean" then
             return v
         end
+
         if coerce and type(v) == "string" then
             local lower = v:lower()
+
             if TRUE_WORDS[lower] then
                 return true
             end
+
             if FALSE_WORDS[lower] == false then
                 return false
             end
         end
+
         return fail(issues, path, "type", `expected boolean, got $(type_name(v))`)
     end
 end
@@ -232,114 +272,154 @@ function base_checks.vector()
         if type(v) == "vector" then
             return v
         end
+
         return fail(issues, path, "type", `expected vector, got $(type_name(v))`)
     end
 end
 
 function base_checks.literal(s)
     local expected = s.value
+
     return function(v, path, issues)
         if v == expected then
             return v
         end
+
         return fail(issues, path, "literal", `expected $(tojson(expected))`)
     end
 end
 
 function base_checks.oneof(s)
     local set = {}
+
     for _, value in ipairs(s.values) do
         set[value] = true
     end
+
     local names = {}
+
     for i, value in ipairs(s.values) do
         names[i] = tojson(value)
     end
+
     local listed = table.concat(names, ", ")
+
     return function(v, path, issues)
         if v ~= nil and set[v] then
             return v
         end
+
         return fail(issues, path, "oneof", `expected one of $listed`)
     end
 end
 
 function base_checks.array(s)
     local item = runner(s.item)
+
     return function(v, path, issues)
         if type(v) ~= "table" then
             return fail(issues, path, "type", `expected array, got $(type_name(v))`)
         end
+
         local n = #v
+
         for k in pairs(v) do
             if math_type(k) ~= "integer" or k < 1 or k > n then
-                return fail(issues, path, "type", "expected array, got table with non-sequence keys")
+                return fail(
+                    issues,
+                    path,
+                    "type",
+                    "expected array, got table with non-sequence keys"
+                )
             end
         end
+
         local out = {}
         local before = issues.n
+
         for i = 1, n do
             local parsed = item(v[i], { path, i }, issues)
             out[i] = parsed
         end
+
         if issues.n > before then
             return nil
         end
+
         return out
     end
 end
 
 function base_checks.tuple(s)
     local items = {}
+
     for i, item in ipairs(s.items) do
         items[i] = runner(item)
     end
+
     local count = #items
+
     return function(v, path, issues)
         if type(v) ~= "table" then
             return fail(issues, path, "type", `expected array, got $(type_name(v))`)
         end
+
         if #v > count then
             return fail(issues, path, "length", `expected at most $count items, got $(#v)`)
         end
+
         local out = {}
         local before = issues.n
+
         for i = 1, count do
             out[i] = items[i](v[i], { path, i }, issues)
         end
+
         if issues.n > before then
             return nil
         end
+
         return out
     end
 end
 
 function base_checks.object(s)
     local keys, runs = {}, {}
+
     for key in pairs(s.shape) do
         keys[#keys + 1] = key
     end
-    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+    table.sort(keys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+
     for i, key in ipairs(keys) do
         runs[i] = runner(s.shape[key])
     end
+
     local count = #keys
     local unknown = s.unknown or "strip"
     local shape = s.shape
     local rest = s.rest and runner(s.rest)
+
     return function(v, path, issues)
         if type(v) ~= "table" then
             return fail(issues, path, "type", `expected object, got $(type_name(v))`)
         end
+
         local out = {}
         local before = issues.n
+
         for i = 1, count do
             local key = keys[i]
             local parsed = runs[i](v[key], { path, key }, issues)
+
             if parsed ~= nil then
                 out[key] = parsed
             end
         end
+
         if unknown ~= "strip" or rest then
             for key, value in pairs(v) do
                 if shape[key] == nil then
@@ -353,9 +433,11 @@ function base_checks.object(s)
                 end
             end
         end
+
         if issues.n > before then
             return nil
         end
+
         return out
     end
 end
@@ -363,40 +445,51 @@ end
 function base_checks.record(s)
     local key_run = runner(s.key)
     local value_run = runner(s.value)
+
     return function(v, path, issues)
         if type(v) ~= "table" then
             return fail(issues, path, "type", `expected object, got $(type_name(v))`)
         end
+
         local out = {}
         local before = issues.n
+
         for key, value in pairs(v) do
             local k = key_run(key, { path, key }, issues)
             local parsed = value_run(value, { path, key }, issues)
+
             if k ~= nil then
                 out[k] = parsed
             end
         end
+
         if issues.n > before then
             return nil
         end
+
         return out
     end
 end
 
 function base_checks.union(s)
     local options = {}
+
     for i, option in ipairs(s.options) do
         options[i] = runner(option)
     end
+
     return function(v, path, issues)
         local trial = { n = 0 }
+
         for _, run in ipairs(options) do
             trial.n = 0
             local parsed = run(v, path, trial)
+
             if trial.n == 0 then
                 return parsed
             end
         end
+
         return fail(issues, path, "union", "matches none of the allowed schemas")
     end
 end
@@ -404,10 +497,12 @@ end
 function base_checks.lazy(s)
     local get = s.get
     local run
+
     return function(v, path, issues)
         if run == nil then
             run = runner(get())
         end
+
         return run(v, path, issues)
     end
 end
@@ -416,16 +511,20 @@ end
 -- a number.
 local function measure(v)
     local t = type(v)
+
     if t == "string" or t == "table" then
         return #v, true
     end
+
     return v, false
 end
 
 local function size_check(op, limit, message)
     return function(v, path, issues)
         local size, counted = measure(v)
+
         local ok
+
         if op == "min" then
             ok = size >= limit
         elseif op == "max" then
@@ -433,15 +532,19 @@ local function size_check(op, limit, message)
         else
             ok = size == limit
         end
+
         if ok then
             return v
         end
+
         local text = message
+
         if text == nil then
             local unit = counted and (type(v) == "string" and " characters" or " items") or ""
             local word = op == "min" and "at least" or op == "max" and "at most" or "exactly"
             text = `expected $word $limit$unit`
         end
+
         return fail(issues, path, op, text)
     end
 end
@@ -451,55 +554,73 @@ compile = function(s)
     local checks = s.checks
     local transforms = s.transforms
     local run = base
+
     if checks or transforms then
         local list = checks or {}
         local tlist = transforms or {}
+
         run = function(v, path, issues)
             local before = issues.n
             local value = base(v, path, issues)
+
             if issues.n > before then
                 return nil
             end
+
             for i = 1, #list do
                 value = list[i](value, path, issues)
+
                 if issues.n > before then
                     return nil
                 end
             end
+
             for i = 1, #tlist do
                 value = tlist[i](value)
             end
+
             return value
         end
     end
+
     local optional, nullable, default = s.optional_flag, s.nullable_flag, s.default_value
+
     if default ~= nil then
         local inner = run
         local is_function = type(default) == "function"
+
         return function(v, path, issues)
             if v == nil then
                 if is_function then
                     return default()
                 end
+
                 return default
             end
+
             return inner(v, path, issues)
         end
     end
+
     if optional or nullable then
         local inner = run
+
         return function(v, path, issues)
             if v == nil then
                 return nil
             end
+
             return inner(v, path, issues)
         end
     end
+
     local inner = run
+
     return function(v, path, issues)
         if v == nil then
             return fail(issues, path, "required", "required")
         end
+
         return inner(v, path, issues)
     end
 end
@@ -612,10 +733,18 @@ end
 --- string to the type before checking it. Query strings and command line
 --- arguments carry every value as a string.
 M.coerce = {
-    string = function() return make("string", { coerce = true }) end,
-    number = function() return make("number", { coerce = true }) end,
-    integer = function() return make("integer", { coerce = true }) end,
-    boolean = function() return make("boolean", { coerce = true }) end,
+    string = function()
+        return make("string", { coerce = true })
+    end,
+    number = function()
+        return make("number", { coerce = true })
+    end,
+    integer = function()
+        return make("integer", { coerce = true })
+    end,
+    boolean = function()
+        return make("boolean", { coerce = true })
+    end,
 }
 
 -- Methods -----------------------------------------------------------------------
@@ -677,6 +806,7 @@ function Schema:pattern(pattern, message)
         if string.find(v, pattern) then
             return v
         end
+
         return fail(issues, path, "pattern", message or `does not match $pattern`)
     end)
 end
@@ -690,6 +820,7 @@ function Schema:refine(predicate, message)
         if predicate(v) then
             return v
         end
+
         return fail(issues, path, "refine", message or "is invalid")
     end)
 end
@@ -698,12 +829,7 @@ end
 --- @param fn function The transformation.
 --- @return table
 function Schema:transform(fn)
-    local list = {}
-    if self.transforms then
-        for i, t in ipairs(self.transforms) do
-            list[i] = t
-        end
-    end
+    local list = self.transforms and table.clone(self.transforms) or {}
     list[#list + 1] = fn
     return derive(self, { transforms = list })
 end
@@ -731,13 +857,12 @@ end
 --- @param shape table A table from keys to schemas.
 --- @return table
 function Schema:extend(shape)
-    local merged = {}
-    for k, v in pairs(self.shape) do
-        merged[k] = v
-    end
+    local merged = table.clone(self.shape)
+
     for k, v in pairs(shape) do
         merged[k] = v
     end
+
     return derive(self, { shape = merged })
 end
 
@@ -745,9 +870,11 @@ end
 --- @return table
 function Schema:partial()
     local shape = {}
+
     for k, v in pairs(self.shape) do
         shape[k] = v:optional()
     end
+
     return derive(self, { shape = shape })
 end
 
@@ -768,9 +895,11 @@ end
 function Schema:parse(value)
     local issues = { n = 0 }
     local parsed = runner(self)(value, nil, issues)
+
     if issues.n > 0 then
         error(parse_error(issues), 2)
     end
+
     return parsed
 end
 
@@ -784,9 +913,11 @@ end
 function Schema:check(value)
     local issues = { n = 0 }
     local parsed = runner(self)(value, nil, issues)
+
     if issues.n > 0 then
         return false, parse_error(issues)
     end
+
     return true, parsed
 end
 
@@ -812,28 +943,36 @@ end
 
 local function projector(s)
     local kind = s.kind
+
     if kind == "object" then
         local keys, subs = {}, {}
+
         for key, sub in pairs(s.shape) do
             local n = #keys + 1
             keys[n] = key
             subs[n] = projector(sub)
         end
+
         local count = #keys
         local keep = s.unknown == "keep"
+
         return function(v)
             if type(v) ~= "table" then
                 return v
             end
+
             local out = {}
+
             for i = 1, count do
                 local key = keys[i]
                 local value = v[key]
+
                 if value ~= nil then
                     local sub = subs[i]
                     out[key] = sub and sub(value) or value
                 end
             end
+
             if keep then
                 for key, value in pairs(v) do
                     if out[key] == nil and s.shape[key] == nil then
@@ -841,32 +980,43 @@ local function projector(s)
                     end
                 end
             end
+
             return out
         end
     elseif kind == "array" then
         local item = projector(s.item)
+
         if item == nil then
             return nil
         end
+
         return function(v)
             if type(v) ~= "table" then
                 return v
             end
+
             local out = {}
+
             for i = 1, #v do
                 out[i] = item(v[i])
             end
+
             return out
         end
     elseif kind == "lazy" then
         local inner
+
         return function(v)
             if inner == nil then
-                inner = projector(s.get()) or function(x) return x end
+                inner = projector(s.get()) or function(x)
+                    return x
+                end
             end
+
             return inner(v)
         end
     end
+
     return nil
 end
 
@@ -878,9 +1028,11 @@ end
 --- @return function
 function Schema:serializer()
     local project = projector(self)
+
     if project == nil then
         return tojson
     end
+
     return function(v)
         return tojson(project(v))
     end
@@ -889,6 +1041,7 @@ end
 local function json_schema(s)
     local out
     local kind = s.kind
+
     if kind == "string" or kind == "number" or kind == "integer" or kind == "boolean" then
         out = { type = kind }
     elseif kind == "literal" then
@@ -899,23 +1052,30 @@ local function json_schema(s)
         out = { type = "array", items = json_schema(s.item) }
     elseif kind == "tuple" then
         local items = {}
+
         for i, item in ipairs(s.items) do
             items[i] = json_schema(item)
         end
+
         out = { type = "array", prefixItems = items, items = false }
     elseif kind == "object" then
         local props, required = {}, {}
+
         for key, sub in pairs(s.shape) do
             props[key] = json_schema(sub)
+
             if not (sub.optional_flag or sub.nullable_flag or sub.default_value ~= nil) then
                 required[#required + 1] = key
             end
         end
+
         table.sort(required)
         out = { type = "object", properties = props }
+
         if #required > 0 then
             out.required = required
         end
+
         if s.unknown == "strict" then
             out.additionalProperties = false
         elseif s.rest then
@@ -925,22 +1085,28 @@ local function json_schema(s)
         out = { type = "object", additionalProperties = json_schema(s.value) }
     elseif kind == "union" then
         local any = {}
+
         for i, option in ipairs(s.options) do
             any[i] = json_schema(option)
         end
+
         out = { anyOf = any }
     else
         out = {}
     end
+
     if s.description then
         out.description = s.description
     end
+
     if s.default_value ~= nil and type(s.default_value) ~= "function" then
         out.default = s.default_value
     end
+
     if s.nullable_flag and out.type then
         out.type = { out.type, "null" }
     end
+
     return out
 end
 
